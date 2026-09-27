@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  -webkit-tap-highlight-color: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background-color: #f1f5f9;
+  font-size: 18px;
+  line-height: 1.6;
+}
+
+.fade-in {
+  animation: fadeIn .3s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+button {
+  font-family: inherit;
+}
+
+/* 打印样式：导出 PDF 时使用 */
+@media print {
+  body {
+    background: #fff !important;
+    font-size: 14px;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  #report-content {
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+    background: #fff !important;
+  }
+
+  .print-page {
+    page-break-after: always;
+  }
+
+  .avoid-break {
+    page-break-inside: avoid;
+  }
+
+  @page {
+    margin: 15mm 12mm;
+    size: A4;
+  }
+}
