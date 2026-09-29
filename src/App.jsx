@@ -1,6 +1,11 @@
 import React, { useState, useEffect } from 'react';
 
 /* ============================================================
+   高德地图 Web 服务 Key
+   ============================================================ */
+const AMAP_KEY = 'b3ef210b81486f2a82d84de8b6af5f36';
+
+/* ============================================================
    语音朗读（浏览器原生 TTS）
    ============================================================ */
 function speak(text) {
@@ -12,12 +17,10 @@ function speak(text) {
   utter.pitch = 1.0;
   window.speechSynthesis.speak(utter);
 }
-
 function stopSpeak() {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
   window.speechSynthesis.cancel();
 }
-
 function buildReadText(label, options) {
   const optText = options.map((o, i) => `${i + 1}，${o.label}`).join('。');
   return `${label}。${optText}`;
@@ -29,17 +32,12 @@ function buildReadText(label, options) {
 function SpeakButton({ text, size = 'md' }) {
   const fontSize = size === 'lg' ? 28 : size === 'sm' ? 16 : 22;
   return (
-    <button
-      type="button"
-      onClick={() => speak(text)}
+    <button type="button" onClick={() => speak(text)}
       style={{
-        width: 44, height: 44, borderRadius: 22,
-        background: '#eff6ff', border: 'none',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        cursor: 'pointer', fontSize, flexShrink: 0,
-      }}
-      title="朗读"
-    >
+        width: 44, height: 44, borderRadius: 22, background: '#eff6ff', border: 'none',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+        fontSize, flexShrink: 0
+      }}>
       🔊
     </button>
   );
@@ -123,9 +121,15 @@ function todayStr() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
+function formatDistance(meters) {
+  if (!meters && meters !== 0) return '';
+  const km = Number(meters) / 1000;
+  if (km < 1) return `${Math.round(meters)} 米`;
+  return `${km.toFixed(1)} 公里`;
+}
 
 /* ============================================================
-   量表数据（去掉 emoji，选项加序号显示）
+   量表数据
    ============================================================ */
 const MORSE_ITEMS = [
   {
@@ -461,13 +465,13 @@ function generatePlan(assessment, envCheck, riskLevel) {
 export default function App() {
   const [tab, setTab] = useState('home');
   const [screen, setScreen] = useState('home');
+  const [editTargetId, setEditTargetId] = useState(null);
+  const [isEditing, setIsEditing] = useState(false);
 
-  // 档案
   const [profiles, setProfiles] = useState([]);
   const [currentProfileId, setCurrentProfileId] = useState(null);
   const currentProfile = profiles.find(p => p.id === currentProfileId) || null;
 
-  // 评估流程
   const [step, setStep] = useState(0);
   const [morse, setMorse] = useState({});
   const [hendrich, setHendrich] = useState({});
@@ -476,7 +480,14 @@ export default function App() {
   const [tinetti, setTinetti] = useState({ balance: {}, gait: {} });
   const [env, setEnv] = useState({ mood: null, interest: null, toiletRail: null, nightLight: null, floorSafe: null, shoes: null });
 
-  // 从 localStorage 加载
+  // 附近医院相关
+  const [userLocation, setUserLocation] = useState(null);
+  const [locationStatus, setLocationStatus] = useState('idle');
+  const [hospitals, setHospitals] = useState([]);
+  const [hospitalType, setHospitalType] = useState('医院');
+  const [hospitalLoading, setHospitalLoading] = useState(false);
+  const [hospitalError, setHospitalError] = useState('');
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem('fall-risk-web-v1');
@@ -488,7 +499,6 @@ export default function App() {
     } catch (e) { }
   }, []);
 
-  // 保存到 localStorage
   useEffect(() => {
     try {
       localStorage.setItem('fall-risk-web-v1', JSON.stringify({ profiles, currentProfileId }));
@@ -499,21 +509,128 @@ export default function App() {
     setProfiles(prev => prev.map(p => p.id === currentProfileId ? updater(p) : p));
   };
 
-  /* ---------- 紧急拨打 120 ---------- */
   const handleCall120 = () => {
     if (window.confirm('是否拨打 120 急救电话？')) {
       window.location.href = 'tel:120';
     }
   };
 
-  /* ---------- 导航 ---------- */
+  /* ---------- 定位 + 高德 API 搜索 ---------- */
+  const requestLocation = () => {
+    if (!navigator.geolocation) {
+      setLocationStatus('unsupported');
+      return;
+    }
+    setLocationStatus('loading');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setUserLocation(loc);
+        setLocationStatus('success');
+        // 定位成功后自动搜索
+        searchNearby(loc.lat, loc.lng, hospitalType);
+      },
+      (err) => {
+        console.warn('定位失败：', err.message);
+        setLocationStatus('denied');
+      },
+      { timeout: 10000, enableHighAccuracy: true, maximumAge: 60000 }
+    );
+  };
+
+  const searchNearby = async (lat, lng, type) => {
+    setHospitalLoading(true);
+    setHospitalError('');
+    setHospitals([]);
+    try {
+      // 高德周边搜索 API
+      // 关键词：医院 / 养老院 / 敬老院 / 护理院
+      const keywords = type === '医院' ? '医院' : '养老院|敬老院|护理院|养老服务中心';
+      const url = `https://restapi.amap.com/v3/place/around?key=${AMAP_KEY}`
+        + `&location=${lng},${lat}`
+        + `&keywords=${encodeURIComponent(keywords)}`
+        + `&radius=10000`
+        + `&offset=25`
+        + `&page=1`
+        + `&extensions=all`;
+
+      const res = await fetch(url);
+      const data = await res.json();
+
+      if (data.status !== '1' || data.infocode !== '10000') {
+        setHospitalError(`搜索失败：${data.info || '未知错误'}（${data.infocode || ''}）`);
+        setHospitalLoading(false);
+        return;
+      }
+
+      const pois = (data.pois || []).map(p => {
+        let phone = '';
+        if (p.tel) {
+          phone = Array.isArray(p.tel) ? p.tel[0] : String(p.tel).split(';')[0];
+        }
+        // 过滤掉无效电话
+        if (phone && !/^[\d\-+() ]+$/.test(phone)) phone = '';
+        return {
+          id: p.id,
+          name: p.name,
+          address: typeof p.address === 'string' ? p.address : '',
+          distance: Number(p.distance) || 0,
+          phone,
+          type: p.type ? p.type.split(';')[0] : '',
+          location: p.location,
+        };
+      }).filter(p => p.name && p.name.length > 0);
+
+      setHospitals(pois);
+      setHospitalLoading(false);
+    } catch (err) {
+      console.error(err);
+      setHospitalError('网络请求失败，请检查网络连接后重试');
+      setHospitalLoading(false);
+    }
+  };
+
+  const switchHospitalType = (type) => {
+    setHospitalType(type);
+    if (userLocation) {
+      searchNearby(userLocation.lat, userLocation.lng, type);
+    }
+  };
+
+  /* ---------- 编辑档案 ---------- */
+  const goEditProfile = (id) => {
+    stopSpeak();
+    setEditTargetId(id);
+    setScreen('editProfile');
+    setTab('history');
+  };
+
+  /* ---------- 修改评估 ---------- */
+  const goEditAssessment = () => {
+    if (!currentProfile || !currentProfile.assessment) return;
+    stopSpeak();
+    const a = currentProfile.assessment;
+    setMorse(a.morse || {});
+    setHendrich(a.hendrich || {});
+    setBerg(a.berg || {});
+    setTug(a.tug !== undefined && a.tug !== null ? String(a.tug) : '');
+    setTinetti(a.tinetti || { balance: {}, gait: {} });
+    setEnv(currentProfile.envCheck || { mood: null, interest: null, toiletRail: null, nightLight: null, floorSafe: null, shoes: null });
+    setStep(0);
+    setIsEditing(true);
+    setScreen('editAssessment');
+    setTab('assess');
+  };
+
   const go = (s) => {
     stopSpeak();
     setScreen(s);
-    setTab(s === 'plan' ? 'plan' : s === 'history' || s === 'report' ? 'history' : ['newProfile', 'screening', 'lowBranch', 'assessment', 'result'].includes(s) ? 'assess' : 'home');
+    setTab(s === 'plan' ? 'plan'
+      : (s === 'history' || s === 'about' || s === 'agreement' || s === 'contact' || s === 'nearby' || s === 'editProfile') ? 'history'
+        : ['newProfile', 'screening', 'lowBranch', 'assessment', 'editAssessment', 'result'].includes(s) ? 'assess'
+          : 'home');
   };
 
-  /* ---------- 完成评估 ---------- */
   const handleAssessmentComplete = () => {
     const morseScore = sumValues(morse);
     const hendrichScore = sumValues(hendrich);
@@ -524,14 +641,24 @@ export default function App() {
     const riskLevel = aggregateRisk({ morse: morseScore, hendrich: hendrichScore, berg: bergScore, tug: tugNum, tinetti: tinettiScore });
     const plan = generatePlan({ morse, hendrich, berg, tug: tugNum, tinetti }, env, riskLevel);
 
-    updateProfile(p => ({
-      ...p,
-      assessment: { morse, hendrich, berg, tug: tugNum, tinetti },
-      envCheck: env,
-      riskLevel,
-      planItems: plan,
-      history: [...(p.history || []), { date: todayStr(), type: 'full', riskLevel }],
-    }));
+    updateProfile(p => {
+      let newHistory = [...(p.history || [])];
+      if (isEditing && p.assessment && newHistory.length > 0) {
+        const lastIdx = newHistory.length - 1;
+        newHistory[lastIdx] = { ...newHistory[lastIdx], isModified: true };
+      }
+      newHistory.push({ date: todayStr(), type: 'full', riskLevel });
+
+      return {
+        ...p,
+        assessment: { morse, hendrich, berg, tug: tugNum, tinetti },
+        envCheck: env,
+        riskLevel,
+        planItems: plan,
+        history: newHistory,
+      };
+    });
+    setIsEditing(false);
     go('result');
   };
 
@@ -633,9 +760,8 @@ export default function App() {
   );
 
   /* ---------- 建立档案 ---------- */
-  const renderNewProfile = () => {
-    const [name, setName] = [window._npName, window._npSetName] || [null, null];
-    return <NewProfileForm onSave={(data) => {
+  const renderNewProfile = () => (
+    <NewProfileForm onSave={(data) => {
       const count = profiles.length;
       const d = new Date();
       const prefix = `FRA-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -649,7 +775,29 @@ export default function App() {
       setProfiles(prev => [...prev, newP]);
       setCurrentProfileId(newP.id);
       go('home');
-    }} onCancel={() => go('home')} />;
+    }} onCancel={() => go('home')} />
+  );
+
+  /* ---------- 编辑档案 ---------- */
+  const renderEditProfile = () => {
+    const target = profiles.find(p => p.id === editTargetId);
+    if (!target) {
+      return (
+        <div className="text-center py-10">
+          <div className="text-slate-500 mb-4">未找到档案</div>
+          <BigButton onClick={() => go('history')}>返回</BigButton>
+        </div>
+      );
+    }
+    return <EditProfileForm
+      profile={target}
+      onSave={(data) => {
+        setProfiles(prev => prev.map(p => p.id === editTargetId ? { ...p, ...data } : p));
+        setEditTargetId(null);
+        go('history');
+      }}
+      onCancel={() => { setEditTargetId(null); go('history'); }}
+    />;
   };
 
   /* ---------- 初筛 ---------- */
@@ -693,7 +841,6 @@ export default function App() {
   /* ---------- 全面评估 ---------- */
   const renderAssessment = () => {
     const renderStep = () => {
-      /* Morse */
       if (stepKey === 'morse') {
         return (
           <div>
@@ -724,7 +871,6 @@ export default function App() {
         );
       }
 
-      /* Hendrich */
       if (stepKey === 'hendrich') {
         return (
           <div>
@@ -757,7 +903,6 @@ export default function App() {
         );
       }
 
-      /* Berg */
       if (stepKey === 'berg') {
         return (
           <div>
@@ -790,7 +935,6 @@ export default function App() {
         );
       }
 
-      /* TUG */
       if (stepKey === 'tug') {
         return (
           <Card>
@@ -809,7 +953,6 @@ export default function App() {
         );
       }
 
-      /* Tinetti */
       if (stepKey === 'tinetti') {
         const Section = ({ title, items, dataKey }) => (
           <div className="mb-5">
@@ -846,7 +989,6 @@ export default function App() {
         );
       }
 
-      /* 环境 */
       if (stepKey === 'env') {
         const YesNo = ({ label, field }) => (
           <div className="py-3 border-b border-slate-100 last:border-0">
@@ -900,7 +1042,10 @@ export default function App() {
           <button onClick={() => { stopSpeak(); if (step > 0) setStep(step - 1); else go('home'); }} className="text-blue-600 text-lg font-semibold">‹ 上一步</button>
           <div className="text-slate-400">{step + 1}/{STEPS.length}</div>
         </div>
-        <div className="text-2xl font-bold text-slate-800 mb-4">阶段二 · {STEP_TITLES[stepKey]}</div>
+        <div className="text-2xl font-bold text-slate-800 mb-4">
+          阶段二 · {STEP_TITLES[stepKey]}
+          {isEditing && <span className="text-base text-amber-600 ml-2">（修改中）</span>}
+        </div>
         <div className="h-2 bg-slate-200 rounded-full overflow-hidden mb-5">
           <div className="h-full bg-blue-600 transition-all" style={{ width: progress + '%' }}></div>
         </div>
@@ -911,7 +1056,7 @@ export default function App() {
           if (step < STEPS.length - 1) setStep(step + 1);
           else handleAssessmentComplete();
         }}>
-          {step === STEPS.length - 1 ? '完成评估' : '下一步'}
+          {step === STEPS.length - 1 ? (isEditing ? '保存修改' : '完成评估') : '下一步'}
         </BigButton>
       </div>
     );
@@ -977,6 +1122,7 @@ export default function App() {
         </Card>
 
         <BigButton onClick={() => go('plan')}>查看计划</BigButton>
+        <BigButton variant="ghost" onClick={goEditAssessment}>✏️ 修改评估</BigButton>
         <BigButton variant="ghost" onClick={() => go('home')}>返回首页</BigButton>
       </div>
     );
@@ -1040,6 +1186,9 @@ export default function App() {
           <span className="font-bold text-slate-800">档案列表</span>
           <span className="text-sm text-slate-500">共 {profiles.length} 人</span>
         </div>
+        {profiles.length === 0 && (
+          <div className="text-center py-6 text-slate-400">暂无档案</div>
+        )}
         {profiles.map(p => (
           <div key={p.id} className={`rounded-xl border-2 mb-2 overflow-hidden ${p.id === currentProfileId ? 'border-blue-500 bg-blue-50' : 'border-slate-200'}`}>
             <button onClick={() => { setCurrentProfileId(p.id); go('home'); }} className="w-full text-left px-4 py-3">
@@ -1047,19 +1196,392 @@ export default function App() {
                 <span className="font-bold text-slate-800">{p.name}</span>
                 <span className="text-sm text-slate-500">{p.profileNumber}</span>
               </div>
-              <div className="text-sm text-slate-500 mt-1">{p.age} 岁 · {p.sex === 'male' ? '男' : '女'}</div>
+              <div className="text-sm text-slate-500 mt-1">
+                {p.age} 岁 · {p.sex === 'male' ? '男' : '女'} · {p.hasChronic ? '有慢病' : '无慢病'}
+                {p.riskLevel && <span className="ml-2">· 当前：{{ low: '低风险', medium: '中风险', high: '高风险' }[p.riskLevel]}</span>}
+              </div>
             </button>
+            <div className="flex border-t border-slate-200">
+              <button onClick={() => goEditProfile(p.id)}
+                className="flex-1 py-2.5 text-sm text-blue-600 font-semibold border-r border-slate-200 active:bg-blue-50">
+                ✏️ 编辑
+              </button>
+              <button onClick={() => {
+                if (!window.confirm(`确定删除「${p.name}」的档案吗？所有记录将被清除。`)) return;
+                setProfiles(prev => {
+                  const remaining = prev.filter(x => x.id !== p.id);
+                  if (currentProfileId === p.id) {
+                    setCurrentProfileId(remaining[0]?.id || null);
+                  }
+                  return remaining;
+                });
+              }}
+                className="flex-1 py-2.5 text-sm text-rose-500 font-semibold active:bg-rose-50">
+                🗑 删除
+              </button>
+            </div>
           </div>
         ))}
         <BigButton onClick={() => go('newProfile')}>+ 新建档案</BigButton>
       </Card>
 
-      {currentProfile && currentProfile.assessment && (
+      {currentProfile && (currentProfile.history || []).length > 0 && (
         <Card>
-          <div className="font-bold text-slate-800 mb-3">数据与安全</div>
-          <div className="text-sm text-slate-500 mb-3">数据保存在本机浏览器中</div>
+          <div className="font-bold text-slate-800 mb-3">评估记录</div>
+          {[...(currentProfile.history || [])].reverse().map((h, i) => (
+            <div key={i} className="flex justify-between items-center py-2.5 border-b border-slate-100 last:border-0">
+              <div>
+                <div className="text-slate-700 font-bold">
+                  {h.date}
+                  {h.isModified && <span className="ml-2 text-xs text-amber-600 font-normal">（修改前）</span>}
+                </div>
+                <div className="text-sm text-slate-400 mt-0.5">{h.type === 'full' ? '全面评估' : '初筛'}</div>
+              </div>
+              <RiskBadge level={h.riskLevel} size="sm" />
+            </div>
+          ))}
         </Card>
       )}
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-3">更多</div>
+        <button onClick={() => go('nearby')}
+          className="w-full flex justify-between items-center py-3.5 border-b border-slate-100 active:bg-slate-50">
+          <span className="text-slate-700">📍 附近医院 / 养老院</span>
+          <span className="text-slate-300">›</span>
+        </button>
+        <button onClick={() => go('about')}
+          className="w-full flex justify-between items-center py-3.5 border-b border-slate-100 active:bg-slate-50">
+          <span className="text-slate-700">📖 关于我们</span>
+          <span className="text-slate-300">›</span>
+        </button>
+        <button onClick={() => go('agreement')}
+          className="w-full flex justify-between items-center py-3.5 border-b border-slate-100 active:bg-slate-50">
+          <span className="text-slate-700">📄 我的协议</span>
+          <span className="text-slate-300">›</span>
+        </button>
+        <button onClick={() => go('contact')}
+          className="w-full flex justify-between items-center py-3.5 border-b border-slate-100 active:bg-slate-50">
+          <span className="text-slate-700">💬 联系客服</span>
+          <span className="text-slate-300">›</span>
+        </button>
+        <div className="w-full flex justify-between items-center py-3.5">
+          <span className="text-slate-500 text-sm">版本</span>
+          <span className="text-slate-400 text-sm">V1.0.0</span>
+        </div>
+      </Card>
+    </div>
+  );
+
+  /* ---------- 附近医院 / 养老院（高德 API） ---------- */
+  const renderNearbyHospitals = () => (
+    <div className="space-y-4 fade-in">
+      <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
+      <div className="text-2xl font-bold text-slate-800">附近医院与养老院</div>
+
+      {/* 定位卡片 */}
+      <Card>
+        {locationStatus === 'idle' && (
+          <div>
+            <div className="text-slate-600 mb-3">点击下方按钮获取您的位置，系统会显示附近 10 公里内的医疗机构</div>
+            <BigButton onClick={requestLocation}>📍 获取我的位置并搜索</BigButton>
+          </div>
+        )}
+        {locationStatus === 'loading' && (
+          <div className="text-center py-3 text-slate-500">📍 正在定位…</div>
+        )}
+        {locationStatus === 'success' && (
+          <div className="flex justify-between items-center">
+            <div>
+              <div className="text-emerald-700 font-bold">📍 已定位</div>
+              <div className="text-xs text-slate-500 mt-1">
+                纬度 {userLocation.lat.toFixed(4)}，经度 {userLocation.lng.toFixed(4)}
+              </div>
+            </div>
+            <button onClick={requestLocation} className="text-blue-600 text-sm font-semibold">重新定位</button>
+          </div>
+        )}
+        {locationStatus === 'denied' && (
+          <div>
+            <div className="text-amber-700 font-bold mb-2">⚠️ 未能获取您的位置</div>
+            <div className="text-sm text-slate-600 mb-3">请在浏览器设置中允许位置权限后重试</div>
+            <BigButton onClick={requestLocation}>重新定位</BigButton>
+          </div>
+        )}
+        {locationStatus === 'unsupported' && (
+          <div className="text-slate-600 text-sm">当前浏览器不支持定位功能，请使用 Chrome / Safari / Edge 等现代浏览器</div>
+        )}
+      </Card>
+
+      {/* 定位成功后显示内容 */}
+      {locationStatus === 'success' && (
+        <>
+          {/* 类型切换 */}
+          <div className="flex gap-2">
+            {[{ v: '医院', l: '🏥 医院' }, { v: '养老院', l: '🏠 养老院' }].map(opt => (
+              <button key={opt.v} onClick={() => switchHospitalType(opt.v)}
+                className={`flex-1 h-12 rounded-xl border-2 font-bold transition ${hospitalType === opt.v ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600'}`}>
+                {opt.l}
+              </button>
+            ))}
+          </div>
+
+          {/* 加载中 */}
+          {hospitalLoading && (
+            <Card>
+              <div className="text-center py-4 text-slate-500">正在搜索附近的{hospitalType}…</div>
+            </Card>
+          )}
+
+          {/* 错误提示 */}
+          {hospitalError && !hospitalLoading && (
+            <Card className="bg-rose-50 border-rose-200">
+              <div className="text-rose-700 font-bold mb-1">搜索失败</div>
+              <div className="text-sm text-rose-600">{hospitalError}</div>
+            </Card>
+          )}
+
+          {/* 无结果 */}
+          {!hospitalLoading && !hospitalError && hospitals.length === 0 && (
+            <Card>
+              <div className="text-center py-4 text-slate-500">
+                附近 10 公里内未找到{hospitalType}，<br />
+                请尝试切换类型或扩大搜索范围
+              </div>
+            </Card>
+          )}
+
+          {/* 结果列表 */}
+          {!hospitalLoading && hospitals.length > 0 && (
+            <>
+              <div className="text-sm text-slate-500">
+                共找到 {hospitals.length} 家{hospitalType}，按距离排序：
+              </div>
+              {hospitals.map(h => (
+                <Card key={h.id}>
+                  <div className="font-bold text-slate-800 text-base">
+                    {hospitalType === '医院' ? '🏥' : '🏠'} {h.name}
+                  </div>
+                  <div className="text-sm text-blue-600 font-semibold mt-1">
+                    距离约 {formatDistance(h.distance)}
+                  </div>
+                  {h.address && (
+                    <div className="text-sm text-slate-500 mt-1">📍 {h.address}</div>
+                  )}
+                  {h.type && (
+                    <div className="text-xs text-slate-400 mt-1">类型：{h.type}</div>
+                  )}
+                  <div className="flex gap-2 mt-3">
+                    {h.phone ? (
+                      <a href={`tel:${h.phone}`}
+                        className="flex-1 h-11 rounded-xl bg-blue-600 text-white font-bold flex items-center justify-center active:bg-blue-700">
+                        📞 {h.phone}
+                      </a>
+                    ) : (
+                      <div className="flex-1 h-11 rounded-xl bg-slate-100 text-slate-400 font-bold flex items-center justify-center">
+                        暂无电话
+                      </div>
+                    )}
+                    <a href={`https://uri.amap.com/marker?position=${h.location}&name=${encodeURIComponent(h.name)}`}
+                      target="_blank" rel="noreferrer"
+                      className="flex-1 h-11 rounded-xl bg-white border-2 border-slate-200 text-slate-700 font-bold flex items-center justify-center active:bg-slate-50">
+                      🗺 导航
+                    </a>
+                  </div>
+                </Card>
+              ))}
+            </>
+          )}
+        </>
+      )}
+
+      <Card className="bg-amber-50 border-amber-200">
+        <div className="text-sm text-amber-800 leading-relaxed">
+          <div className="font-bold mb-1">⚠️ 温馨提示</div>
+          以上信息由高德地图实时提供，仅供参考。具体地址、电话、营业时间以机构官方公布为准。<br />
+          <span className="font-bold">如遇紧急情况，请立即拨打 120。</span>
+        </div>
+      </Card>
+    </div>
+  );
+
+  /* ---------- 关于我们 ---------- */
+  const renderAbout = () => (
+    <div className="space-y-4 fade-in">
+      <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
+      <div className="text-2xl font-bold text-slate-800">关于我们</div>
+
+      <Card>
+        <div className="text-center mb-4">
+          <div className="text-5xl mb-2">🏥</div>
+          <div className="text-xl font-bold text-slate-800">老年人跌倒风险评估与管理系统</div>
+          <div className="text-sm text-slate-500 mt-1">V1.0.0</div>
+        </div>
+        <div className="text-base text-slate-700 leading-relaxed">
+          本系统是一款面向社区医疗机构、养老机构和家庭的移动端健康管理应用，
+          为 65 岁以上老年人，或 60 岁以上且有慢性病/跌倒史的老年人提供跌倒风险快速筛查、
+          综合评估与个体化干预管理服务。
+        </div>
+      </Card>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-2">🎯 核心功能</div>
+        <div className="text-base text-slate-700 leading-relaxed">
+          • 两阶段筛查评估：快速初筛 + 五大量表综合评估<br />
+          • 智能风险分级：Morse、Hendrich II、Berg、TUG、Tinetti 多工具聚合<br />
+          • 个体化干预计划：根据评估结果自动生成运动、用药、环境改造建议<br />
+          • 附近医院查询：基于高德地图 API 实时搜索周边医疗机构<br />
+          • 隐私保护：数据本地存储，支持指纹/面容解锁
+        </div>
+      </Card>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-2">💡 技术特点</div>
+        <div className="text-base text-slate-700 leading-relaxed">
+          1. 采用国际标准化量表进行多工具综合评估<br />
+          2. 基于评估异常项自动生成个体化干预计划<br />
+          3. 集成高德地图 Web 服务 API 实现附近机构查询<br />
+          4. 纯本地化存储，支持 PDF 报告导出与历史记录追踪
+        </div>
+      </Card>
+
+      <Card className="bg-blue-50 border-blue-200">
+        <div className="text-sm text-blue-800 leading-relaxed">
+          <div className="font-bold mb-1">📌 适用范围</div>
+          本工具仅作跌倒风险初步筛查辅助，不替代医护人员的专业诊断。
+          如有健康问题，请及时就医。
+        </div>
+      </Card>
+
+      <BigButton variant="ghost" onClick={() => go('history')}>返回</BigButton>
+    </div>
+  );
+
+  /* ---------- 我的协议 ---------- */
+  const renderAgreement = () => (
+    <div className="space-y-4 fade-in">
+      <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
+      <div className="text-2xl font-bold text-slate-800">我的协议</div>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-3">📄 用户服务协议</div>
+        <div className="text-sm text-slate-600 leading-relaxed">
+          1. 本系统为老年人跌倒风险评估辅助工具，评估结果仅供参考，不构成医疗诊断。<br /><br />
+          2. 用户在使用本系统过程中，应如实填写老年人健康信息，不得虚报或隐瞒。<br /><br />
+          3. 本系统不对因用户自行使用评估结果进行的任何医疗行为承担责任。<br /><br />
+          4. 用户应妥善保管个人账号信息及设备安全，因设备丢失或泄露造成的损失由用户自行承担。
+        </div>
+      </Card>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-3">🔒 隐私政策</div>
+        <div className="text-sm text-slate-600 leading-relaxed">
+          1. 本系统所有数据均保存在用户设备本地（浏览器 localStorage / 手机本地存储），不上传至任何服务器。<br /><br />
+          2. 系统不收集任何个人信息用于商业用途。<br /><br />
+          3. 用户可随时通过"我的-清除全部数据"功能删除所有本地数据。<br /><br />
+          4. 系统支持指纹/面容解锁功能，用于防止未授权访问，生物特征信息由设备系统管理，本系统不存储任何生物特征数据。<br /><br />
+          5. 使用"附近医院"功能时，系统会将您的临时定位信息加密传输至高德地图服务器，仅用于本次查询，不存储、不关联个人身份。
+        </div>
+      </Card>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-3">⚠️ 免责声明</div>
+        <div className="text-sm text-slate-600 leading-relaxed">
+          本工具仅为跌倒风险初步筛查辅助工具，评估结果仅供参考，不可替代医护人员的专业诊断。
+          如有健康问题，请及时就医。使用者应结合专业医护人员的意见，做出医疗决策。
+          本系统开发方不对因使用本工具产生的任何直接或间接损失承担责任。
+        </div>
+      </Card>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-3">📊 数据安全说明</div>
+        <div className="text-sm text-slate-600 leading-relaxed">
+          1. 数据存储：所有评估数据仅保存在本机，卸载应用或清除浏览器缓存后数据将丢失。<br /><br />
+          2. 数据备份：建议定期通过"导出数据"功能备份档案信息。<br /><br />
+          3. 数据分享：如需将评估报告分享给医护人员，请通过"导出 PDF 报告"功能手动分享。
+        </div>
+      </Card>
+
+      <BigButton variant="ghost" onClick={() => go('history')}>返回</BigButton>
+    </div>
+  );
+
+  /* ---------- 联系客服 ---------- */
+  const renderContact = () => (
+    <div className="space-y-4 fade-in">
+      <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
+      <div className="text-2xl font-bold text-slate-800">联系客服</div>
+
+      <Card>
+        <div className="text-center mb-4">
+          <div className="text-5xl mb-2">💬</div>
+          <div className="text-base text-slate-700">
+            如在使用过程中遇到问题或有建议，<br />
+            欢迎通过以下方式联系我们
+          </div>
+        </div>
+      </Card>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-3">📮 联系方式</div>
+        <div className="space-y-3">
+          <div className="flex items-center gap-3 py-2 border-b border-slate-100">
+            <span className="text-2xl">📧</span>
+            <div className="flex-1">
+              <div className="text-sm text-slate-500">反馈邮箱</div>
+              <div className="text-base text-slate-800 font-semibold">support@fallrisk.app</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 py-2 border-b border-slate-100">
+            <span className="text-2xl">💬</span>
+            <div className="flex-1">
+              <div className="text-sm text-slate-500">客服微信</div>
+              <div className="text-base text-slate-800 font-semibold">fallrisk_service</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 py-2 border-b border-slate-100">
+            <span className="text-2xl">📱</span>
+            <div className="flex-1">
+              <div className="text-sm text-slate-500">反馈电话</div>
+              <div className="text-base text-slate-800 font-semibold">400-000-0000</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 py-2">
+            <span className="text-2xl">🕐</span>
+            <div className="flex-1">
+              <div className="text-sm text-slate-500">服务时间</div>
+              <div className="text-base text-slate-800 font-semibold">9:00 - 18:00（工作日）</div>
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      <Card>
+        <div className="font-bold text-slate-800 mb-3">❓ 常见问题</div>
+        <div className="space-y-3 text-sm text-slate-600 leading-relaxed">
+          <div>
+            <div className="font-bold text-slate-700">Q：数据会丢失吗？</div>
+            <div>A：数据保存在本机，卸载应用或清除浏览器缓存后数据会丢失。建议定期导出备份。</div>
+          </div>
+          <div>
+            <div className="font-bold text-slate-700">Q：评估结果准确吗？</div>
+            <div>A：本系统采用国际标准化量表，但仅作初步筛查辅助，不能替代医生的专业诊断。</div>
+          </div>
+          <div>
+            <div className="font-bold text-slate-700">Q：可以多人使用吗？</div>
+            <div>A：可以。在"我的"页面点击"+新建档案"可以为多个老年人建立独立档案。</div>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="bg-blue-50 border-blue-200">
+        <div className="text-sm text-blue-800 leading-relaxed">
+          <div className="font-bold mb-1">⚠️ 紧急情况提醒</div>
+          如遇老年人跌倒等紧急情况，请立即拨打 <span className="font-bold">120</span> 急救电话。
+        </div>
+      </Card>
+
+      <BigButton variant="ghost" onClick={() => go('history')}>返回</BigButton>
     </div>
   );
 
@@ -1087,12 +1609,18 @@ export default function App() {
   const renderScreen = () => {
     if (screen === 'home') return renderHome();
     if (screen === 'newProfile') return renderNewProfile();
+    if (screen === 'editProfile') return renderEditProfile();
     if (screen === 'screening') return renderScreening();
     if (screen === 'lowBranch') return renderLowRisk();
     if (screen === 'assessment') return renderAssessment();
+    if (screen === 'editAssessment') return renderAssessment();
     if (screen === 'result') return renderResult();
     if (screen === 'plan') return renderPlan();
     if (screen === 'history') return renderHistory();
+    if (screen === 'nearby') return renderNearbyHospitals();
+    if (screen === 'about') return renderAbout();
+    if (screen === 'agreement') return renderAgreement();
+    if (screen === 'contact') return renderContact();
     return renderHome();
   };
 
@@ -1101,7 +1629,16 @@ export default function App() {
       <header className="sticky top-0 z-10 bg-white/95 backdrop-blur border-b border-slate-200">
         <div className="max-w-lg mx-auto px-4 h-14 flex items-center">
           <div className="font-bold text-slate-800 text-lg">
-            {screen === 'home' ? '首页' : screen === 'assessment' ? '阶段二 · 全面评估' : screen === 'result' ? '评估结果' : screen === 'plan' ? '我的计划' : '跌倒风险管理'}
+            {screen === 'home' ? '首页'
+              : (screen === 'assessment' || screen === 'editAssessment') ? '阶段二 · 全面评估'
+                : screen === 'result' ? '评估结果'
+                  : screen === 'editProfile' ? '编辑档案'
+                    : screen === 'plan' ? '我的计划'
+                      : screen === 'nearby' ? '附近医院'
+                        : screen === 'about' ? '关于我们'
+                          : screen === 'agreement' ? '我的协议'
+                            : screen === 'contact' ? '联系客服'
+                              : '跌倒风险管理'}
           </div>
         </div>
       </header>
@@ -1112,7 +1649,7 @@ export default function App() {
 }
 
 /* ============================================================
-   子组件：档案表单 / 初筛表单
+   子组件
    ============================================================ */
 function NewProfileForm({ onSave, onCancel }) {
   const [name, setName] = useState('');
@@ -1168,6 +1705,76 @@ function NewProfileForm({ onSave, onCancel }) {
       )}
       <BigButton disabled={!canSubmit} onClick={() => onSave({ name: name.trim(), age: ageNum, sex, hasChronic, hasFallHistory })}>
         保存并开始初筛
+      </BigButton>
+    </div>
+  );
+}
+
+function EditProfileForm({ profile, onSave, onCancel }) {
+  const [name, setName] = useState(profile.name);
+  const [age, setAge] = useState(String(profile.age));
+  const [sex, setSex] = useState(profile.sex);
+  const [hasChronic, setHasChronic] = useState(profile.hasChronic);
+  const [hasFallHistory, setHasFallHistory] = useState(profile.hasFallHistory);
+
+  const ageNum = Number(age);
+  const eligible = (ageNum >= 65) || (ageNum >= 60 && (hasChronic === true || hasFallHistory === true));
+  const canSubmit = name.trim() && ageNum > 0 && eligible;
+
+  return (
+    <div className="space-y-4 fade-in">
+      <button onClick={onCancel} className="text-blue-600 text-lg">‹ 返回</button>
+      <div className="text-2xl font-bold text-slate-800">编辑档案</div>
+
+      <Card className="bg-blue-50 border-blue-200">
+        <div className="text-sm text-blue-800">
+          档案号：<span className="font-bold">{profile.profileNumber}</span>
+        </div>
+        <div className="text-xs text-slate-500 mt-1">修改基本信息不会影响已有评估记录</div>
+      </Card>
+
+      <Card>
+        <label className="block font-bold text-slate-700 mb-2">姓名</label>
+        <input value={name} onChange={e => setName(e.target.value)} placeholder="请输入姓名"
+          className="w-full h-14 px-4 rounded-xl border-2 border-slate-200 focus:border-blue-500 outline-none text-lg" />
+      </Card>
+      <Card>
+        <label className="block font-bold text-slate-700 mb-2">年龄</label>
+        <input type="number" value={age} onChange={e => setAge(e.target.value)} placeholder="请输入年龄"
+          className="w-full h-14 px-4 rounded-xl border-2 border-slate-200 focus:border-blue-500 outline-none text-lg" />
+      </Card>
+      <Card>
+        <div className="font-bold text-slate-700 mb-3">性别</div>
+        <div className="grid grid-cols-2 gap-3">
+          {[{ v: 'male', l: '男' }, { v: 'female', l: '女' }].map(o => (
+            <button key={o.v} onClick={() => setSex(o.v)}
+              className={`h-14 rounded-xl border-2 font-bold text-lg ${sex === o.v ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600'}`}>{o.l}</button>
+          ))}
+        </div>
+      </Card>
+      <Card>
+        <div className="font-bold text-slate-700 mb-3">是否有慢性病？</div>
+        <div className="grid grid-cols-2 gap-3">
+          <button onClick={() => setHasChronic(true)} className={`h-14 rounded-xl border-2 font-bold text-lg ${hasChronic === true ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600'}`}>是</button>
+          <button onClick={() => setHasChronic(false)} className={`h-14 rounded-xl border-2 font-bold text-lg ${hasChronic === false ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600'}`}>否</button>
+        </div>
+      </Card>
+      <Card>
+        <div className="font-bold text-slate-700 mb-3">过去是否有跌倒史？</div>
+        <div className="grid grid-cols-2 gap-3">
+          <button onClick={() => setHasFallHistory(true)} className={`h-14 rounded-xl border-2 font-bold text-lg ${hasFallHistory === true ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600'}`}>是</button>
+          <button onClick={() => setHasFallHistory(false)} className={`h-14 rounded-xl border-2 font-bold text-lg ${hasFallHistory === false ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-600'}`}>否</button>
+        </div>
+      </Card>
+      {ageNum > 0 && (
+        <div className={`rounded-xl p-4 ${eligible ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
+          {eligible ? '✓ 符合本工具适用范围' : '⚠ 暂不符合纳入条件'}
+        </div>
+      )}
+      <BigButton disabled={!canSubmit} onClick={() => onSave({
+        name: name.trim(), age: ageNum, sex, hasChronic, hasFallHistory,
+      })}>
+        保存修改
       </BigButton>
     </div>
   );
