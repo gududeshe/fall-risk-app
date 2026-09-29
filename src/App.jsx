@@ -6,7 +6,116 @@ import React, { useState, useEffect } from 'react';
 const AMAP_KEY = 'b3ef210b81486f2a82d84de8b6af5f36';
 
 /* ============================================================
-   语音朗读（浏览器原生 TTS）
+   存储键
+   ============================================================ */
+const PIN_STORAGE_KEY = 'fall-risk-web-pin-v1';
+const ADMIN_PIN_KEY = 'fall-risk-web-admin-pin-v1';
+const BIO_STORAGE_KEY = 'fall-risk-web-bio-v1';
+
+function getStoredPin() {
+  try { return localStorage.getItem(PIN_STORAGE_KEY) || ''; } catch { return ''; }
+}
+function setStoredPin(pin) {
+  try { localStorage.setItem(PIN_STORAGE_KEY, pin); } catch { }
+}
+function removeStoredPin() {
+  try { localStorage.removeItem(PIN_STORAGE_KEY); } catch { }
+}
+
+function getStoredAdminPin() {
+  try { return localStorage.getItem(ADMIN_PIN_KEY) || ''; } catch { return ''; }
+}
+function setStoredAdminPin(pin) {
+  try { localStorage.setItem(ADMIN_PIN_KEY, pin); } catch { }
+}
+function removeStoredAdminPin() {
+  try { localStorage.removeItem(ADMIN_PIN_KEY); } catch { }
+}
+
+function getStoredBioCredId() {
+  try { return localStorage.getItem(BIO_STORAGE_KEY) || ''; } catch { return ''; }
+}
+function setStoredBioCredId(id) {
+  try { localStorage.setItem(BIO_STORAGE_KEY, id); } catch { }
+}
+function removeStoredBioCredId() {
+  try { localStorage.removeItem(BIO_STORAGE_KEY); } catch { }
+}
+
+/* ============================================================
+   WebAuthn 指纹/面容
+   ============================================================ */
+async function isBiometricSupported() {
+  if (typeof window === 'undefined' || !window.PublicKeyCredential) return false;
+  try {
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch { return false; }
+}
+
+function bufToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let str = '';
+  for (let i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlToBuf(str) {
+  const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+  const b64 = str.replace(/-/g, '+').replace(/_/g, '/') + pad;
+  const raw = atob(b64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  return bytes;
+}
+
+async function registerBiometric() {
+  const challenge = new Uint8Array(32);
+  crypto.getRandomValues(challenge);
+  const credential = await navigator.credentials.create({
+    publicKey: {
+      challenge,
+      rp: { name: '老年人跌倒风险评估与管理系统' },
+      user: {
+        id: new TextEncoder().encode('user-' + Date.now()),
+        name: 'fallrisk-user',
+        displayName: '老年人跌倒风险评估用户',
+      },
+      pubKeyCredParams: [
+        { type: 'public-key', alg: -7 },
+        { type: 'public-key', alg: -257 },
+      ],
+      authenticatorSelection: {
+        authenticatorAttachment: 'platform',
+        userVerification: 'required',
+        requireResidentKey: false,
+      },
+      timeout: 60000,
+      attestation: 'none',
+    },
+  });
+  if (!credential) return null;
+  return bufToB64url(credential.rawId);
+}
+
+async function verifyBiometric(credId) {
+  const challenge = new Uint8Array(32);
+  crypto.getRandomValues(challenge);
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge,
+      allowCredentials: [{
+        id: b64urlToBuf(credId),
+        type: 'public-key',
+        transports: ['internal'],
+      }],
+      userVerification: 'required',
+      timeout: 60000,
+    },
+  });
+  return !!assertion;
+}
+
+/* ============================================================
+   语音朗读
    ============================================================ */
 function speak(text) {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
@@ -79,6 +188,241 @@ function RiskBadge({ level, size = 'md' }) {
 }
 
 /* ============================================================
+   锁屏组件（指纹 → PIN → 管理员重置）
+   ============================================================ */
+function LockScreen({ onUnlock }) {
+  const [input, setInput] = useState('');
+  const [error, setError] = useState('');
+  const [bioStatus, setBioStatus] = useState('checking');
+  const [bioTrying, setBioTrying] = useState(false);
+  const [mode, setMode] = useState('bio'); // bio / pin / admin
+  const PIN_LENGTH = 4;
+
+  const hasPin = !!getStoredPin();
+  const hasAdmin = !!getStoredAdminPin();
+  const bioCredId = getStoredBioCredId();
+
+  useEffect(() => {
+    (async () => {
+      const supported = await isBiometricSupported();
+      if (!supported || !bioCredId) {
+        setBioStatus('unavailable');
+        setMode('pin');
+        return;
+      }
+      setBioStatus('available');
+      setMode('bio');
+      setTimeout(() => tryBiometric(), 300);
+    })();
+  }, []);
+
+  const tryBiometric = async () => {
+    if (bioTrying) return;
+    setBioTrying(true);
+    setError('');
+    try {
+      const ok = await verifyBiometric(bioCredId);
+      if (ok) {
+        onUnlock();
+      } else {
+        setError('验证未通过，请重试');
+        setMode('pin');
+      }
+    } catch (e) {
+      setError('指纹/面容验证失败：' + (e?.message || '未知错误'));
+      setMode('pin');
+    }
+    setBioTrying(false);
+  };
+
+  const handlePress = (digit) => {
+    setError('');
+    if (input.length >= PIN_LENGTH) return;
+    const next = input + digit;
+    setInput(next);
+
+    if (next.length === PIN_LENGTH) {
+      const saved = getStoredPin();
+      if (next === saved) {
+        setTimeout(() => onUnlock(), 150);
+      } else {
+        setTimeout(() => {
+          setError('密码错误，请重试');
+          setInput('');
+        }, 200);
+      }
+    }
+  };
+
+  const handleDelete = () => {
+    setError('');
+    setInput(prev => prev.slice(0, -1));
+  };
+
+  const handleAdminReset = () => {
+    if (!hasAdmin) {
+      alert('本设备未设置管理员密码，无法重置。\n\n请联系系统管理员或清除浏览器数据（数据会丢失）。');
+      return;
+    }
+    if (input.trim() === getStoredAdminPin()) {
+      removeStoredPin();
+      removeStoredBioCredId();
+      alert('已重置成功！请进入 App 后重新设置密码。');
+      onUnlock();
+    } else {
+      setError('管理员密码错误');
+      setInput('');
+    }
+  };
+
+  const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', 'del'];
+
+  return (
+    <div className="min-h-screen bg-slate-100 flex flex-col items-center justify-center px-6">
+      <div className="text-6xl mb-4">🔒</div>
+      <div className="text-2xl font-bold text-slate-800 mb-2">请验证身份</div>
+
+      {/* 指纹 */}
+      {mode === 'bio' && bioStatus === 'available' && (
+        <>
+          <div className="text-slate-500 mb-6 text-center text-sm">请使用指纹 / 面容验证</div>
+          <button
+            onClick={tryBiometric}
+            disabled={bioTrying}
+            className="w-40 h-40 rounded-full bg-white border-4 border-blue-500 flex flex-col items-center justify-center shadow-lg active:bg-blue-50 disabled:opacity-60"
+          >
+            <div className="text-6xl mb-1">👆</div>
+            <div className="text-sm text-blue-600 font-bold">{bioTrying ? '验证中…' : '点击验证'}</div>
+          </button>
+          {error && <div className="text-rose-600 font-semibold mt-4 text-center">{error}</div>}
+          <button onClick={() => { setMode('pin'); setInput(''); setError(''); }}
+            className="text-blue-600 mt-6 text-sm font-semibold">
+            使用密码解锁
+          </button>
+        </>
+      )}
+
+      {/* PIN */}
+      {mode === 'pin' && (
+        <>
+          <div className="text-slate-500 mb-4 text-center text-sm">
+            {hasPin ? '请输入 4 位密码' : '未设置密码'}
+          </div>
+
+          <div className="flex gap-5 mb-4">
+            {[0, 1, 2, 3].map(i => (
+              <div key={i}
+                className={`w-5 h-5 rounded-full border-2 ${i < input.length ? 'bg-blue-600 border-blue-600' : 'border-slate-300'}`} />
+            ))}
+          </div>
+
+          {error && <div className="text-rose-600 font-semibold mb-4">{error}</div>}
+
+          <div className="grid grid-cols-3 gap-3 w-full max-w-xs mt-4">
+            {keys.map((k, i) => (
+              <div key={i} className="flex justify-center">
+                {k === '' ? <div /> : k === 'del' ? (
+                  <button onClick={handleDelete}
+                    className="w-20 h-20 rounded-full bg-slate-50 border-2 border-slate-200 flex items-center justify-center text-2xl text-slate-500 active:bg-slate-100">⌫</button>
+                ) : (
+                  <button onClick={() => handlePress(k)}
+                    className="w-20 h-20 rounded-full bg-white border-2 border-slate-200 flex items-center justify-center text-3xl font-bold text-slate-800 active:bg-blue-50 active:border-blue-500">
+                    {k}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {bioStatus === 'available' && (
+            <button onClick={() => { setMode('bio'); setInput(''); setError(''); setTimeout(tryBiometric, 200); }}
+              className="text-blue-600 mt-6 text-sm font-semibold">
+              👆 改用指纹 / 面容
+            </button>
+          )}
+
+          <button onClick={() => { setMode('admin'); setInput(''); setError(''); }}
+            className="text-slate-500 mt-4 text-sm underline">
+            忘记密码？（需管理员）
+          </button>
+        </>
+      )}
+
+      {/* 管理员重置 */}
+      {mode === 'admin' && (
+        <>
+          <div className="text-slate-700 font-bold mb-2">管理员验证</div>
+          <div className="text-slate-500 mb-6 text-center text-sm leading-relaxed max-w-xs">
+            请输入由家属 / 护理员保管的<br />
+            <span className="font-bold text-slate-700">6 位管理员密码</span><br />
+            用于重置本设备的 PIN 码
+          </div>
+
+          <div className="flex gap-3 mb-4">
+            {[0, 1, 2, 3, 4, 5].map(i => (
+              <div key={i}
+                className={`w-4 h-4 rounded-full border-2 ${i < input.length ? 'bg-blue-600 border-blue-600' : 'border-slate-300'}`} />
+            ))}
+          </div>
+
+          {error && <div className="text-rose-600 font-semibold mb-4">{error}</div>}
+
+          <div className="grid grid-cols-3 gap-3 w-full max-w-xs">
+            {keys.map((k, i) => (
+              <div key={i} className="flex justify-center">
+                {k === '' ? <div /> : k === 'del' ? (
+                  <button onClick={handleDelete}
+                    className="w-20 h-20 rounded-full bg-slate-50 border-2 border-slate-200 flex items-center justify-center text-2xl text-slate-500 active:bg-slate-100">⌫</button>
+                ) : (
+                  <button onClick={() => {
+                    setError('');
+                    if (input.length >= 6) return;
+                    const next = input + k;
+                    setInput(next);
+                    if (next.length === 6) {
+                      if (next === getStoredAdminPin()) {
+                        removeStoredPin();
+                        removeStoredBioCredId();
+                        setTimeout(() => {
+                          alert('已重置成功！请进入 App 后重新设置密码。');
+                          onUnlock();
+                        }, 200);
+                      } else {
+                        setTimeout(() => {
+                          setError('管理员密码错误');
+                          setInput('');
+                        }, 200);
+                      }
+                    }
+                  }}
+                    className="w-20 h-20 rounded-full bg-white border-2 border-slate-200 flex items-center justify-center text-3xl font-bold text-slate-800 active:bg-blue-50 active:border-blue-500">
+                    {k}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <button onClick={() => { setMode('pin'); setInput(''); setError(''); }}
+            className="text-blue-600 mt-6 text-sm font-semibold">
+            ‹ 返回密码输入
+          </button>
+
+          <div className="text-xs text-slate-400 mt-6 text-center max-w-xs leading-relaxed">
+            管理员密码由设置 PIN 时一并生成<br />
+            请妥善保管
+          </div>
+        </>
+      )}
+
+      <div className="text-xs text-slate-400 mt-8 text-center leading-relaxed">
+        本工具数据仅保存在本机
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
    工具函数
    ============================================================ */
 function sumValues(obj) {
@@ -132,40 +476,28 @@ function formatDistance(meters) {
    量表数据
    ============================================================ */
 const MORSE_ITEMS = [
-  {
-    id: 'fallHistory', label: '跌倒史', help: '最近 3 个月内是否跌倒过', options: [
-      { label: '没有跌倒过', value: 0 }, { label: '跌倒过', value: 25 },
-    ]
-  },
-  {
-    id: 'secondaryDx', label: '疾病情况', help: '医生诊断的疾病种类', options: [
-      { label: '只有 1 种疾病', value: 0 }, { label: '有 2 种及以上疾病', value: 15 },
-    ]
-  },
-  {
-    id: 'ambulatory', label: '走路方式', help: '平时走路需要什么帮助', options: [
-      { label: '自己走路，不用辅助', value: 0 },
-      { label: '使用拐杖或助行器', value: 15 },
-      { label: '需要扶着家具或墙壁', value: 30 },
-    ]
-  },
-  {
-    id: 'iv', label: '输液情况', help: '目前是否在接受静脉输液', options: [
-      { label: '没有输液', value: 0 }, { label: '正在输液', value: 20 },
-    ]
-  },
-  {
-    id: 'gait', label: '走路样子', help: '家属观察老人走路的样子', options: [
-      { label: '走路平稳正常', value: 0 },
-      { label: '走路有点摇晃', value: 10 },
-      { label: '走路明显不稳、需搀扶', value: 20 },
-    ]
-  },
-  {
-    id: 'mental', label: '意识状态', help: '是否清楚自己在哪、今天几号', options: [
-      { label: '意识清楚', value: 0 }, { label: '有时迷糊，搞不清方向', value: 15 },
-    ]
-  },
+  { id: 'fallHistory', label: '跌倒史', help: '最近 3 个月内是否跌倒过', options: [
+    { label: '没有跌倒过', value: 0 }, { label: '跌倒过', value: 25 },
+  ]},
+  { id: 'secondaryDx', label: '疾病情况', help: '医生诊断的疾病种类', options: [
+    { label: '只有 1 种疾病', value: 0 }, { label: '有 2 种及以上疾病', value: 15 },
+  ]},
+  { id: 'ambulatory', label: '走路方式', help: '平时走路需要什么帮助', options: [
+    { label: '自己走路，不用辅助', value: 0 },
+    { label: '使用拐杖或助行器', value: 15 },
+    { label: '需要扶着家具或墙壁', value: 30 },
+  ]},
+  { id: 'iv', label: '输液情况', help: '目前是否在接受静脉输液', options: [
+    { label: '没有输液', value: 0 }, { label: '正在输液', value: 20 },
+  ]},
+  { id: 'gait', label: '走路样子', help: '家属观察老人走路的样子', options: [
+    { label: '走路平稳正常', value: 0 },
+    { label: '走路有点摇晃', value: 10 },
+    { label: '走路明显不稳、需搀扶', value: 20 },
+  ]},
+  { id: 'mental', label: '意识状态', help: '是否清楚自己在哪、今天几号', options: [
+    { label: '意识清楚', value: 0 }, { label: '有时迷糊，搞不清方向', value: 15 },
+  ]},
 ];
 
 const HENDRICH_ITEMS = [
@@ -180,213 +512,147 @@ const HENDRICH_ITEMS = [
 ];
 
 const BERG_ITEMS = [
-  {
-    label: '从椅子上站起来', options: [
-      { label: '完全站不起来', value: 0 }, { label: '需要别人搀扶才能站起', value: 1 },
-      { label: '自己用手扶椅子能站起', value: 2 }, { label: '扶着东西能站稳', value: 3 },
-      { label: '不用扶就能站起站稳', value: 4 },
-    ]
-  },
-  {
-    label: '站着不动（2 分钟）', options: [
-      { label: '站不住 2 分钟', value: 0 }, { label: '需要人扶着才能站', value: 1 },
-      { label: '能站住但需要有人在旁', value: 2 }, { label: '能站 2 分钟，稍有不稳', value: 3 },
-      { label: '稳稳站 2 分钟没问题', value: 4 },
-    ]
-  },
-  {
-    label: '坐着不动（2 分钟）', options: [
-      { label: '坐不住 2 分钟', value: 0 }, { label: '坐着有点晃，需要人扶着', value: 1 },
-      { label: '能坐住但不太稳', value: 2 }, { label: '坐得比较稳', value: 3 },
-      { label: '稳稳坐 2 分钟没问题', value: 4 },
-    ]
-  },
-  {
-    label: '从站着坐下', options: [
-      { label: '不会自己坐下', value: 0 }, { label: '坐下过程不稳，需要人扶', value: 1 },
-      { label: '用手扶着椅子慢慢坐下', value: 2 }, { label: '自己能坐下但有点晃', value: 3 },
-      { label: '稳稳当当坐下', value: 4 },
-    ]
-  },
-  {
-    label: '从床上移到椅子', options: [
-      { label: '完全需要人帮助', value: 0 }, { label: '需要别人扶一下', value: 1 },
-      { label: '需要有人在旁边提醒', value: 2 }, { label: '自己能完成，不太稳', value: 3 },
-      { label: '自己能安全完成', value: 4 },
-    ]
-  },
-  {
-    label: '闭着眼睛站着', options: [
-      { label: '闭眼站不住', value: 0 }, { label: '闭眼能站 1-3 秒', value: 1 },
-      { label: '闭眼能站 3 秒', value: 2 }, { label: '闭眼能站 10 秒，有点晃', value: 3 },
-      { label: '闭眼稳稳站 10 秒', value: 4 },
-    ]
-  },
-  {
-    label: '双脚并齐站着不动', options: [
-      { label: '双脚并齐就站不住', value: 0 }, { label: '需要人扶着才能并脚站', value: 1 },
-      { label: '能并脚站，但需要人在旁', value: 2 }, { label: '能并脚站 1 分钟，有点不稳', value: 3 },
-      { label: '稳稳并脚站 1 分钟', value: 4 },
-    ]
-  },
-  {
-    label: '站着伸手够前面的东西', options: [
-      { label: '一伸手就要倒', value: 0 }, { label: '伸手时需要人扶着', value: 1 },
-      { label: '只能往前伸一点点（5 厘米）', value: 2 }, { label: '能往前伸 12 厘米', value: 3 },
-      { label: '能稳稳往前伸 25 厘米', value: 4 },
-    ]
-  },
-  {
-    label: '从地上捡东西', options: [
-      { label: '完全捡不了', value: 0 }, { label: '需要别人帮忙捡', value: 1 },
-      { label: '能自己捡但需要人在旁', value: 2 }, { label: '能捡起来但有点吃力', value: 3 },
-      { label: '轻松弯腰捡起来', value: 4 },
-    ]
-  },
-  {
-    label: '转过身往后看', options: [
-      { label: '转不了身', value: 0 }, { label: '转身需要人帮忙', value: 1 },
-      { label: '能转身但重心不稳', value: 2 }, { label: '能转身往后看，稍有不稳', value: 3 },
-      { label: '转身自然、稳稳往后看', value: 4 },
-    ]
-  },
-  {
-    label: '原地转一圈（360 度）', options: [
-      { label: '完全转不了', value: 0 }, { label: '转身需要人扶', value: 1 },
-      { label: '能转，但转得很慢', value: 2 }, { label: '能转一圈，但有点晃', value: 3 },
-      { label: '稳稳转一圈没问题', value: 4 },
-    ]
-  },
-  {
-    label: '双脚交替踩台阶', options: [
-      { label: '完全踩不了', value: 0 }, { label: '需要人扶着才能踩', value: 1 },
-      { label: '能踩，但需要人在旁看着', value: 2 }, { label: '能踩但有点吃力', value: 3 },
-      { label: '稳稳交替踩没问题', value: 4 },
-    ]
-  },
-  {
-    label: '一只脚在前、一只脚在后站着', options: [
-      { label: '站不了', value: 0 }, { label: '需要人扶着才能站', value: 1 },
-      { label: '能站 30 秒，需要人在旁', value: 2 }, { label: '能站 30 秒，有点不稳', value: 3 },
-      { label: '稳稳站 30 秒', value: 4 },
-    ]
-  },
-  {
-    label: '单腿站着', options: [
-      { label: '站不了 1 秒', value: 0 }, { label: '只能站 1-3 秒', value: 1 },
-      { label: '能站 3-5 秒', value: 2 }, { label: '能站 5-10 秒', value: 3 },
-      { label: '能站 10 秒以上', value: 4 },
-    ]
-  },
+  { label: '从椅子上站起来', options: [
+    { label: '完全站不起来', value: 0 }, { label: '需要别人搀扶才能站起', value: 1 },
+    { label: '自己用手扶椅子能站起', value: 2 }, { label: '扶着东西能站稳', value: 3 },
+    { label: '不用扶就能站起站稳', value: 4 },
+  ]},
+  { label: '站着不动（2 分钟）', options: [
+    { label: '站不住 2 分钟', value: 0 }, { label: '需要人扶着才能站', value: 1 },
+    { label: '能站住但需要有人在旁', value: 2 }, { label: '能站 2 分钟，稍有不稳', value: 3 },
+    { label: '稳稳站 2 分钟没问题', value: 4 },
+  ]},
+  { label: '坐着不动（2 分钟）', options: [
+    { label: '坐不住 2 分钟', value: 0 }, { label: '坐着有点晃，需要人扶着', value: 1 },
+    { label: '能坐住但不太稳', value: 2 }, { label: '坐得比较稳', value: 3 },
+    { label: '稳稳坐 2 分钟没问题', value: 4 },
+  ]},
+  { label: '从站着坐下', options: [
+    { label: '不会自己坐下', value: 0 }, { label: '坐下过程不稳，需要人扶', value: 1 },
+    { label: '用手扶着椅子慢慢坐下', value: 2 }, { label: '自己能坐下但有点晃', value: 3 },
+    { label: '稳稳当当坐下', value: 4 },
+  ]},
+  { label: '从床上移到椅子', options: [
+    { label: '完全需要人帮助', value: 0 }, { label: '需要别人扶一下', value: 1 },
+    { label: '需要有人在旁边提醒', value: 2 }, { label: '自己能完成，不太稳', value: 3 },
+    { label: '自己能安全完成', value: 4 },
+  ]},
+  { label: '闭着眼睛站着', options: [
+    { label: '闭眼站不住', value: 0 }, { label: '闭眼能站 1-3 秒', value: 1 },
+    { label: '闭眼能站 3 秒', value: 2 }, { label: '闭眼能站 10 秒，有点晃', value: 3 },
+    { label: '闭眼稳稳站 10 秒', value: 4 },
+  ]},
+  { label: '双脚并齐站着不动', options: [
+    { label: '双脚并齐就站不住', value: 0 }, { label: '需要人扶着才能并脚站', value: 1 },
+    { label: '能并脚站，但需要人在旁', value: 2 }, { label: '能并脚站 1 分钟，有点不稳', value: 3 },
+    { label: '稳稳并脚站 1 分钟', value: 4 },
+  ]},
+  { label: '站着伸手够前面的东西', options: [
+    { label: '一伸手就要倒', value: 0 }, { label: '伸手时需要人扶着', value: 1 },
+    { label: '只能往前伸一点点（5 厘米）', value: 2 }, { label: '能往前伸 12 厘米', value: 3 },
+    { label: '能稳稳往前伸 25 厘米', value: 4 },
+  ]},
+  { label: '从地上捡东西', options: [
+    { label: '完全捡不了', value: 0 }, { label: '需要别人帮忙捡', value: 1 },
+    { label: '能自己捡但需要人在旁', value: 2 }, { label: '能捡起来但有点吃力', value: 3 },
+    { label: '轻松弯腰捡起来', value: 4 },
+  ]},
+  { label: '转过身往后看', options: [
+    { label: '转不了身', value: 0 }, { label: '转身需要人帮忙', value: 1 },
+    { label: '能转身但重心不稳', value: 2 }, { label: '能转身往后看，稍有不稳', value: 3 },
+    { label: '转身自然、稳稳往后看', value: 4 },
+  ]},
+  { label: '原地转一圈（360 度）', options: [
+    { label: '完全转不了', value: 0 }, { label: '转身需要人扶', value: 1 },
+    { label: '能转，但转得很慢', value: 2 }, { label: '能转一圈，但有点晃', value: 3 },
+    { label: '稳稳转一圈没问题', value: 4 },
+  ]},
+  { label: '双脚交替踩台阶', options: [
+    { label: '完全踩不了', value: 0 }, { label: '需要人扶着才能踩', value: 1 },
+    { label: '能踩，但需要人在旁看着', value: 2 }, { label: '能踩但有点吃力', value: 3 },
+    { label: '稳稳交替踩没问题', value: 4 },
+  ]},
+  { label: '一只脚在前、一只脚在后站着', options: [
+    { label: '站不了', value: 0 }, { label: '需要人扶着才能站', value: 1 },
+    { label: '能站 30 秒，需要人在旁', value: 2 }, { label: '能站 30 秒，有点不稳', value: 3 },
+    { label: '稳稳站 30 秒', value: 4 },
+  ]},
+  { label: '单腿站着', options: [
+    { label: '站不了 1 秒', value: 0 }, { label: '只能站 1-3 秒', value: 1 },
+    { label: '能站 3-5 秒', value: 2 }, { label: '能站 5-10 秒', value: 3 },
+    { label: '能站 10 秒以上', value: 4 },
+  ]},
 ];
 
 const TINETTI_BALANCE = [
-  {
-    id: 't1', label: '坐位平衡', options: [
-      { label: '在椅子上倾斜或滑动', value: 0 }, { label: '坐得稳稳当当', value: 1 },
-    ]
-  },
-  {
-    id: 't2', label: '从椅子上站起', options: [
-      { label: '必须有人帮忙才能站起', value: 0 }, { label: '需要用手扶着才能站起', value: 1 },
-      { label: '不用手扶就能站起', value: 2 },
-    ]
-  },
-  {
-    id: 't3', label: '刚站起来时的平衡', options: [
-      { label: '站起来不稳，需要扶', value: 0 }, { label: '需要扶着东西才能站稳', value: 1 },
-      { label: '不用扶就能站稳', value: 2 },
-    ]
-  },
-  {
-    id: 't4', label: '站着时的平衡', options: [
-      { label: '站不稳', value: 0 }, { label: '需要扶着，双脚分开站', value: 1 },
-      { label: '不用扶，双脚并拢站得稳', value: 2 },
-    ]
-  },
-  {
-    id: 't5', label: '轻轻推一下', options: [
-      { label: '一推就要倒', value: 0 }, { label: '摇晃、抓东西但能稳住', value: 1 },
-      { label: '推一下也很稳', value: 2 },
-    ]
-  },
-  {
-    id: 't6', label: '闭着眼睛站着', options: [
-      { label: '闭眼站不稳', value: 0 }, { label: '闭眼能站稳', value: 1 },
-    ]
-  },
-  {
-    id: 't7', label: '原地转一圈（360 度）', options: [
-      { label: '转身不稳（抓东西、摇晃）', value: 0 }, { label: '能转但脚步不连贯', value: 1 },
-      { label: '转身稳定连贯', value: 2 },
-    ]
-  },
-  {
-    id: 't8', label: '坐下动作', options: [
-      { label: '坐下不安全（判断错误）', value: 0 }, { label: '用胳膊辅助或动作不平稳', value: 1 },
-      { label: '安全平稳坐下', value: 2 },
-    ]
-  },
-  {
-    id: 't9', label: '转身走回座位', options: [
-      { label: '需要扶持或步态不稳', value: 0 }, { label: '不需扶持，走得稳', value: 1 },
-    ]
-  },
+  { id: 't1', label: '坐位平衡', options: [
+    { label: '在椅子上倾斜或滑动', value: 0 }, { label: '坐得稳稳当当', value: 1 },
+  ]},
+  { id: 't2', label: '从椅子上站起', options: [
+    { label: '必须有人帮忙才能站起', value: 0 }, { label: '需要用手扶着才能站起', value: 1 },
+    { label: '不用手扶就能站起', value: 2 },
+  ]},
+  { id: 't3', label: '刚站起来时的平衡', options: [
+    { label: '站起来不稳，需要扶', value: 0 }, { label: '需要扶着东西才能站稳', value: 1 },
+    { label: '不用扶就能站稳', value: 2 },
+  ]},
+  { id: 't4', label: '站着时的平衡', options: [
+    { label: '站不稳', value: 0 }, { label: '需要扶着，双脚分开站', value: 1 },
+    { label: '不用扶，双脚并拢站得稳', value: 2 },
+  ]},
+  { id: 't5', label: '轻轻推一下', options: [
+    { label: '一推就要倒', value: 0 }, { label: '摇晃、抓东西但能稳住', value: 1 },
+    { label: '推一下也很稳', value: 2 },
+  ]},
+  { id: 't6', label: '闭着眼睛站着', options: [
+    { label: '闭眼站不稳', value: 0 }, { label: '闭眼能站稳', value: 1 },
+  ]},
+  { id: 't7', label: '原地转一圈（360 度）', options: [
+    { label: '转身不稳（抓东西、摇晃）', value: 0 }, { label: '能转但脚步不连贯', value: 1 },
+    { label: '转身稳定连贯', value: 2 },
+  ]},
+  { id: 't8', label: '坐下动作', options: [
+    { label: '坐下不安全（判断错误）', value: 0 }, { label: '用胳膊辅助或动作不平稳', value: 1 },
+    { label: '安全平稳坐下', value: 2 },
+  ]},
+  { id: 't9', label: '转身走回座位', options: [
+    { label: '需要扶持或步态不稳', value: 0 }, { label: '不需扶持，走得稳', value: 1 },
+  ]},
 ];
 
 const TINETTI_GAIT = [
-  {
-    id: 'g1', label: '走路启动', options: [
-      { label: '犹豫或多次尝试才开始走', value: 0 }, { label: '无犹豫，直接开始走', value: 1 },
-    ]
-  },
-  {
-    id: 'g2', label: '右脚迈步长度', options: [
-      { label: '右脚没有超过左脚', value: 0 }, { label: '右脚超过左脚', value: 1 },
-    ]
-  },
-  {
-    id: 'g3', label: '右脚抬脚高度', options: [
-      { label: '右脚拖地，没离地', value: 0 }, { label: '右脚完全抬离地面', value: 1 },
-    ]
-  },
-  {
-    id: 'g4', label: '左脚迈步长度', options: [
-      { label: '左脚没有超过右脚', value: 0 }, { label: '左脚超过右脚', value: 1 },
-    ]
-  },
-  {
-    id: 'g5', label: '左脚抬脚高度', options: [
-      { label: '左脚拖地，没离地', value: 0 }, { label: '左脚完全抬离地面', value: 1 },
-    ]
-  },
-  {
-    id: 'g6', label: '左右步态对称性', options: [
-      { label: '左右步长不一样', value: 0 }, { label: '左右步长差不多', value: 1 },
-    ]
-  },
-  {
-    id: 'g7', label: '走路连续性', options: [
-      { label: '走路有停顿、不连贯', value: 0 }, { label: '走路连贯、不停顿', value: 1 },
-    ]
-  },
-  {
-    id: 'g8', label: '走路路线', options: [
-      { label: '明显偏离（走歪）', value: 0 }, { label: '轻微偏离或需要辅助', value: 1 },
-      { label: '走直线不偏离', value: 2 },
-    ]
-  },
-  {
-    id: 'g9', label: '走路时躯干稳定性', options: [
-      { label: '明显摇晃或需要扶', value: 0 }, { label: '膝盖弯曲但没有摇晃', value: 1 },
-      { label: '走得很稳，双臂自然', value: 2 },
-    ]
-  },
-  {
-    id: 'g10', label: '走路时两脚间距', options: [
-      { label: '两脚分得很开', value: 0 }, { label: '两脚间距正常', value: 1 },
-    ]
-  },
+  { id: 'g1', label: '走路启动', options: [
+    { label: '犹豫或多次尝试才开始走', value: 0 }, { label: '无犹豫，直接开始走', value: 1 },
+  ]},
+  { id: 'g2', label: '右脚迈步长度', options: [
+    { label: '右脚没有超过左脚', value: 0 }, { label: '右脚超过左脚', value: 1 },
+  ]},
+  { id: 'g3', label: '右脚抬脚高度', options: [
+    { label: '右脚拖地，没离地', value: 0 }, { label: '右脚完全抬离地面', value: 1 },
+  ]},
+  { id: 'g4', label: '左脚迈步长度', options: [
+    { label: '左脚没有超过右脚', value: 0 }, { label: '左脚超过右脚', value: 1 },
+  ]},
+  { id: 'g5', label: '左脚抬脚高度', options: [
+    { label: '左脚拖地，没离地', value: 0 }, { label: '左脚完全抬离地面', value: 1 },
+  ]},
+  { id: 'g6', label: '左右步态对称性', options: [
+    { label: '左右步长不一样', value: 0 }, { label: '左右步长差不多', value: 1 },
+  ]},
+  { id: 'g7', label: '走路连续性', options: [
+    { label: '走路有停顿、不连贯', value: 0 }, { label: '走路连贯、不停顿', value: 1 },
+  ]},
+  { id: 'g8', label: '走路路线', options: [
+    { label: '明显偏离（走歪）', value: 0 }, { label: '轻微偏离或需要辅助', value: 1 },
+    { label: '走直线不偏离', value: 2 },
+  ]},
+  { id: 'g9', label: '走路时躯干稳定性', options: [
+    { label: '明显摇晃或需要扶', value: 0 }, { label: '膝盖弯曲但没有摇晃', value: 1 },
+    { label: '走得很稳，双臂自然', value: 2 },
+  ]},
+  { id: 'g10', label: '走路时两脚间距', options: [
+    { label: '两脚分得很开', value: 0 }, { label: '两脚间距正常', value: 1 },
+  ]},
 ];
 
 const HIGH_RISK_FACTORS = ['使用 4 种以上药物', '帕金森病', '卒中', '视力障碍', '认知障碍', '骨质疏松', '关节炎', '糖尿病', '慢性心肺疾病'];
@@ -468,6 +734,14 @@ export default function App() {
   const [editTargetId, setEditTargetId] = useState(null);
   const [isEditing, setIsEditing] = useState(false);
 
+  const [locked, setLocked] = useState(false);
+  const [hasPinSet, setHasPinSet] = useState(false);
+  const [hasAdminSet, setHasAdminSet] = useState(false);
+  const [pinChecked, setPinChecked] = useState(false);
+
+  const [bioSupported, setBioSupported] = useState(false);
+  const [bioHas, setBioHas] = useState(false);
+
   const [profiles, setProfiles] = useState([]);
   const [currentProfileId, setCurrentProfileId] = useState(null);
   const currentProfile = profiles.find(p => p.id === currentProfileId) || null;
@@ -480,13 +754,30 @@ export default function App() {
   const [tinetti, setTinetti] = useState({ balance: {}, gait: {} });
   const [env, setEnv] = useState({ mood: null, interest: null, toiletRail: null, nightLight: null, floorSafe: null, shoes: null });
 
-  // 附近医院相关
   const [userLocation, setUserLocation] = useState(null);
   const [locationStatus, setLocationStatus] = useState('idle');
   const [hospitals, setHospitals] = useState([]);
   const [hospitalType, setHospitalType] = useState('医院');
   const [hospitalLoading, setHospitalLoading] = useState(false);
   const [hospitalError, setHospitalError] = useState('');
+
+  useEffect(() => {
+    const pin = getStoredPin();
+    const admin = getStoredAdminPin();
+    const bio = getStoredBioCredId();
+    setHasPinSet(!!pin);
+    setHasAdminSet(!!admin);
+    setBioHas(!!bio);
+    setLocked(!!pin || !!bio);
+    setPinChecked(true);
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      const supported = await isBiometricSupported();
+      setBioSupported(supported);
+    })();
+  }, []);
 
   useEffect(() => {
     try {
@@ -515,7 +806,6 @@ export default function App() {
     }
   };
 
-  /* ---------- 定位 + 高德 API 搜索 ---------- */
   const requestLocation = () => {
     if (!navigator.geolocation) {
       setLocationStatus('unsupported');
@@ -527,7 +817,6 @@ export default function App() {
         const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
         setUserLocation(loc);
         setLocationStatus('success');
-        // 定位成功后自动搜索
         searchNearby(loc.lat, loc.lng, hospitalType);
       },
       (err) => {
@@ -543,61 +832,43 @@ export default function App() {
     setHospitalError('');
     setHospitals([]);
     try {
-      // 高德周边搜索 API
-      // 关键词：医院 / 养老院 / 敬老院 / 护理院
       const keywords = type === '医院' ? '医院' : '养老院|敬老院|护理院|养老服务中心';
       const url = `https://restapi.amap.com/v3/place/around?key=${AMAP_KEY}`
         + `&location=${lng},${lat}`
         + `&keywords=${encodeURIComponent(keywords)}`
-        + `&radius=10000`
-        + `&offset=25`
-        + `&page=1`
-        + `&extensions=all`;
-
+        + `&radius=10000&offset=25&page=1&extensions=all`;
       const res = await fetch(url);
       const data = await res.json();
-
       if (data.status !== '1' || data.infocode !== '10000') {
-        setHospitalError(`搜索失败：${data.info || '未知错误'}（${data.infocode || ''}）`);
+        setHospitalError(`搜索失败：${data.info || '未知错误'}`);
         setHospitalLoading(false);
         return;
       }
-
       const pois = (data.pois || []).map(p => {
         let phone = '';
-        if (p.tel) {
-          phone = Array.isArray(p.tel) ? p.tel[0] : String(p.tel).split(';')[0];
-        }
-        // 过滤掉无效电话
+        if (p.tel) phone = Array.isArray(p.tel) ? p.tel[0] : String(p.tel).split(';')[0];
         if (phone && !/^[\d\-+() ]+$/.test(phone)) phone = '';
         return {
-          id: p.id,
-          name: p.name,
+          id: p.id, name: p.name,
           address: typeof p.address === 'string' ? p.address : '',
-          distance: Number(p.distance) || 0,
-          phone,
+          distance: Number(p.distance) || 0, phone,
           type: p.type ? p.type.split(';')[0] : '',
           location: p.location,
         };
       }).filter(p => p.name && p.name.length > 0);
-
       setHospitals(pois);
       setHospitalLoading(false);
     } catch (err) {
-      console.error(err);
-      setHospitalError('网络请求失败，请检查网络连接后重试');
+      setHospitalError('网络请求失败');
       setHospitalLoading(false);
     }
   };
 
   const switchHospitalType = (type) => {
     setHospitalType(type);
-    if (userLocation) {
-      searchNearby(userLocation.lat, userLocation.lng, type);
-    }
+    if (userLocation) searchNearby(userLocation.lat, userLocation.lng, type);
   };
 
-  /* ---------- 编辑档案 ---------- */
   const goEditProfile = (id) => {
     stopSpeak();
     setEditTargetId(id);
@@ -605,7 +876,6 @@ export default function App() {
     setTab('history');
   };
 
-  /* ---------- 修改评估 ---------- */
   const goEditAssessment = () => {
     if (!currentProfile || !currentProfile.assessment) return;
     stopSpeak();
@@ -626,7 +896,7 @@ export default function App() {
     stopSpeak();
     setScreen(s);
     setTab(s === 'plan' ? 'plan'
-      : (s === 'history' || s === 'about' || s === 'agreement' || s === 'contact' || s === 'nearby' || s === 'editProfile') ? 'history'
+      : (s === 'history' || s === 'about' || s === 'agreement' || s === 'contact' || s === 'nearby' || s === 'editProfile' || s === 'security') ? 'history'
         : ['newProfile', 'screening', 'lowBranch', 'assessment', 'editAssessment', 'result'].includes(s) ? 'assess'
           : 'home');
   };
@@ -637,7 +907,6 @@ export default function App() {
     const bergScore = sumValues(berg);
     const tugNum = Number(tug) || 0;
     const tinettiScore = sumValues(tinetti.balance) + sumValues(tinetti.gait);
-
     const riskLevel = aggregateRisk({ morse: morseScore, hendrich: hendrichScore, berg: bergScore, tug: tugNum, tinetti: tinettiScore });
     const plan = generatePlan({ morse, hendrich, berg, tug: tugNum, tinetti }, env, riskLevel);
 
@@ -648,23 +917,16 @@ export default function App() {
         newHistory[lastIdx] = { ...newHistory[lastIdx], isModified: true };
       }
       newHistory.push({ date: todayStr(), type: 'full', riskLevel });
-
       return {
         ...p,
         assessment: { morse, hendrich, berg, tug: tugNum, tinetti },
-        envCheck: env,
-        riskLevel,
-        planItems: plan,
-        history: newHistory,
+        envCheck: env, riskLevel, planItems: plan, history: newHistory,
       };
     });
     setIsEditing(false);
     go('result');
   };
 
-  /* ============================================================
-     页面渲染
-     ============================================================ */
   const STEPS = ['morse', 'hendrich', 'berg', 'tug', 'tinetti', 'env'];
   const STEP_TITLES = { morse: 'Morse 跌倒评估', hendrich: 'Hendrich II 模型', berg: 'Berg 平衡量表', tug: 'TUG 计时测试', tinetti: 'Tinetti 平衡与步态', env: '认知情绪与环境' };
   const stepKey = STEPS[step];
@@ -678,7 +940,6 @@ export default function App() {
     return true;
   };
 
-  /* ---------- 首页 ---------- */
   const renderHome = () => (
     <div className="space-y-4 fade-in">
       <div className="bg-gradient-to-br from-blue-600 to-blue-500 rounded-2xl p-5 text-white shadow-sm">
@@ -759,7 +1020,6 @@ export default function App() {
     </div>
   );
 
-  /* ---------- 建立档案 ---------- */
   const renderNewProfile = () => (
     <NewProfileForm onSave={(data) => {
       const count = profiles.length;
@@ -778,7 +1038,6 @@ export default function App() {
     }} onCancel={() => go('home')} />
   );
 
-  /* ---------- 编辑档案 ---------- */
   const renderEditProfile = () => {
     const target = profiles.find(p => p.id === editTargetId);
     if (!target) {
@@ -800,14 +1059,12 @@ export default function App() {
     />;
   };
 
-  /* ---------- 初筛 ---------- */
   const renderScreening = () => <ScreeningForm onDone={(result) => {
     updateProfile(p => ({ ...p, screening: result }));
     if (result.result === 'low') go('lowBranch');
     else go('assessment');
   }} onCancel={() => go('home')} />;
 
-  /* ---------- 低风险 ---------- */
   const renderLowRisk = () => (
     <div className="space-y-4 fade-in">
       <Card className="bg-emerald-50 border-emerald-200">
@@ -838,7 +1095,6 @@ export default function App() {
     </div>
   );
 
-  /* ---------- 全面评估 ---------- */
   const renderAssessment = () => {
     const renderStep = () => {
       if (stepKey === 'morse') {
@@ -1062,7 +1318,6 @@ export default function App() {
     );
   };
 
-  /* ---------- 结果 ---------- */
   const renderResult = () => {
     if (!currentProfile || !currentProfile.assessment) return <div className="text-center py-10">暂无评估结果</div>;
     const a = currentProfile.assessment;
@@ -1128,7 +1383,6 @@ export default function App() {
     );
   };
 
-  /* ---------- 计划 ---------- */
   const renderPlan = () => {
     if (!currentProfile || !currentProfile.planItems || currentProfile.planItems.length === 0) {
       return <div className="text-center py-10 text-slate-500">暂无计划，请先完成评估</div>;
@@ -1177,7 +1431,169 @@ export default function App() {
     );
   };
 
-  /* ---------- 历史 ---------- */
+  const renderSecurity = () => (
+    <div className="space-y-4 fade-in">
+      <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
+      <div className="text-2xl font-bold text-slate-800">隐私与安全</div>
+
+      <Card>
+        <div className="flex justify-between items-center mb-3">
+          <div className="font-bold text-slate-800">👆 指纹 / 面容保护</div>
+          <span className={`px-3 py-1 rounded-xl text-sm font-bold ${bioHas ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+            {bioHas ? '已开启' : '未开启'}
+          </span>
+        </div>
+        <div className="text-sm text-slate-600 leading-relaxed mb-3">
+          {!bioSupported
+            ? '当前设备或浏览器不支持指纹 / 面容识别。请使用下方的 PIN 码保护。'
+            : bioHas
+              ? '已开启。打开网页时优先使用指纹 / 面容解锁。'
+              : '建议开启，打开网页时一键解锁，无需输入密码。'}
+        </div>
+        {bioSupported && !bioHas && (
+          <BigButton onClick={async () => {
+            try {
+              const id = await registerBiometric();
+              if (id) {
+                setStoredBioCredId(id);
+                setBioHas(true);
+                alert('指纹 / 面容设置成功！下次打开网页可使用指纹解锁。');
+              } else {
+                alert('设置失败，请重试');
+              }
+            } catch (e) {
+              alert('设置失败：' + (e?.message || '未知错误'));
+            }
+          }}>
+            👆 开启指纹 / 面容保护
+          </BigButton>
+        )}
+        {bioHas && (
+          <BigButton variant="danger" onClick={() => {
+            if (!window.confirm('确定要关闭指纹 / 面容保护吗？')) return;
+            removeStoredBioCredId();
+            setBioHas(false);
+            alert('已关闭');
+          }}>
+            关闭指纹保护
+          </BigButton>
+        )}
+      </Card>
+
+      <Card>
+        <div className="flex justify-between items-center mb-3">
+          <div className="font-bold text-slate-800">🔢 PIN 码保护</div>
+          <span className={`px-3 py-1 rounded-xl text-sm font-bold ${hasPinSet ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+            {hasPinSet ? '已开启' : '未开启'}
+          </span>
+        </div>
+        <div className="text-sm text-slate-600 leading-relaxed mb-3">
+          {hasPinSet
+            ? '已开启，当指纹 / 面容验证失败时可用 PIN 码备选。'
+            : '建议设置 PIN 码，作为指纹失败时的备选方案。'}
+        </div>
+
+        {!hasPinSet && (
+          <BigButton onClick={() => {
+            const pin = window.prompt('请设置 4 位数字 PIN 码（老人日常解锁用）：');
+            if (!pin) return;
+            if (!/^\d{4}$/.test(pin)) { alert('PIN 码必须是 4 位数字'); return; }
+            const confirmPin = window.prompt('请再次输入 PIN 码：');
+            if (confirmPin !== pin) { alert('两次输入不一致'); return; }
+
+            const adminPin = window.prompt(
+              '请设置 6 位管理员密码（由家属/护理员保管）：\n\n' +
+              '用于：老人忘记 PIN 时重置\n' +
+              '注意：管理员密码不能直接解锁，只能用于重置'
+            );
+            if (!adminPin) { alert('必须设置管理员密码'); return; }
+            if (!/^\d{6}$/.test(adminPin)) { alert('管理员密码必须是 6 位数字'); return; }
+            const confirmAdmin = window.prompt('请再次输入管理员密码：');
+            if (confirmAdmin !== adminPin) { alert('两次输入不一致'); return; }
+
+            if (!window.confirm(
+              '请确认：\n\n' +
+              '• PIN 码：' + pin + '（老人日常解锁）\n' +
+              '• 管理员密码：' + adminPin + '（家属保管）\n\n' +
+              '请分别告知老人和家属，妥善保存。'
+            )) return;
+
+            setStoredPin(pin);
+            setStoredAdminPin(adminPin);
+            setHasPinSet(true);
+            setHasAdminSet(true);
+            alert('设置成功！');
+          }}>
+            🔢 设置 PIN 码 + 管理员密码
+          </BigButton>
+        )}
+
+        {hasPinSet && (
+          <div className="space-y-2">
+            <BigButton variant="ghost" onClick={() => {
+              const oldPin = window.prompt('请输入原 PIN 码：');
+              if (oldPin !== getStoredPin()) { alert('原 PIN 码错误'); return; }
+              const newPin = window.prompt('请输入新 PIN 码（4 位数字）：');
+              if (!newPin || !/^\d{4}$/.test(newPin)) { alert('新 PIN 码必须是 4 位数字'); return; }
+              const confirmPin = window.prompt('请再次输入新 PIN 码：');
+              if (confirmPin !== newPin) { alert('两次输入不一致'); return; }
+              setStoredPin(newPin);
+              alert('PIN 码修改成功！');
+            }}>
+              ✏️ 修改 PIN 码
+            </BigButton>
+
+            <BigButton variant="ghost" onClick={() => {
+              const oldAdmin = window.prompt('请输入原管理员密码（6 位）：');
+              if (oldAdmin !== getStoredAdminPin()) { alert('原管理员密码错误'); return; }
+              const newAdmin = window.prompt('请输入新管理员密码（6 位数字）：');
+              if (!newAdmin || !/^\d{6}$/.test(newAdmin)) { alert('新管理员密码必须是 6 位数字'); return; }
+              const confirmAdmin = window.prompt('请再次输入新管理员密码：');
+              if (confirmAdmin !== newAdmin) { alert('两次输入不一致'); return; }
+              setStoredAdminPin(newAdmin);
+              alert('管理员密码修改成功！\n请妥善告知家属。');
+            }}>
+              🔑 修改管理员密码
+            </BigButton>
+
+            <BigButton variant="danger" onClick={() => {
+              if (!window.confirm('确定要关闭 PIN 码保护吗？关闭后任何人打开网页都能查看数据。')) return;
+              removeStoredPin();
+              removeStoredAdminPin();
+              setHasPinSet(false);
+              setHasAdminSet(false);
+              alert('已关闭 PIN 码保护');
+            }}>
+              关闭 PIN 码保护
+            </BigButton>
+          </div>
+        )}
+      </Card>
+
+      <Card className={`${(hasPinSet || bioHas) ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
+        <div className={`font-bold mb-1 ${(hasPinSet || bioHas) ? 'text-emerald-800' : 'text-amber-800'}`}>
+          {(hasPinSet || bioHas) ? '🔒 保护已开启' : '⚠️ 保护未开启'}
+        </div>
+        <div className={`text-sm leading-relaxed ${(hasPinSet || bioHas) ? 'text-emerald-700' : 'text-amber-700'}`}>
+          {(hasPinSet || bioHas)
+            ? '下次打开网页时需要验证身份。忘记 PIN 时，家属可输入管理员密码重置。'
+            : '建议至少开启一种保护方式。'}
+        </div>
+      </Card>
+
+      <Card className="bg-blue-50 border-blue-200">
+        <div className="text-sm text-blue-800 leading-relaxed">
+          <div className="font-bold mb-1">💡 使用说明</div>
+          • <span className="font-bold">PIN 码</span>：老人日常解锁用，4 位数字<br />
+          • <span className="font-bold">管理员密码</span>：家属 / 护理员保管，6 位数字，仅用于重置 PIN<br />
+          • <span className="font-bold">指纹 / 面容</span>：老人一按即可解锁<br />
+          • 三种方式独立工作，互不影响<br />
+          • 所有数据仅保存在本机，不上传服务器
+        </div>
+      </Card>
+    </div>
+  );
+
   const renderHistory = () => (
     <div className="space-y-4 fade-in">
       <div className="text-2xl font-bold text-slate-800">我的</div>
@@ -1250,6 +1666,11 @@ export default function App() {
           <span className="text-slate-700">📍 附近医院 / 养老院</span>
           <span className="text-slate-300">›</span>
         </button>
+        <button onClick={() => go('security')}
+          className="w-full flex justify-between items-center py-3.5 border-b border-slate-100 active:bg-slate-50">
+          <span className="text-slate-700">🔒 隐私与安全</span>
+          <span className="text-slate-300">›</span>
+        </button>
         <button onClick={() => go('about')}
           className="w-full flex justify-between items-center py-3.5 border-b border-slate-100 active:bg-slate-50">
           <span className="text-slate-700">📖 关于我们</span>
@@ -1273,13 +1694,11 @@ export default function App() {
     </div>
   );
 
-  /* ---------- 附近医院 / 养老院（高德 API） ---------- */
   const renderNearbyHospitals = () => (
     <div className="space-y-4 fade-in">
       <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
       <div className="text-2xl font-bold text-slate-800">附近医院与养老院</div>
 
-      {/* 定位卡片 */}
       <Card>
         {locationStatus === 'idle' && (
           <div>
@@ -1309,14 +1728,12 @@ export default function App() {
           </div>
         )}
         {locationStatus === 'unsupported' && (
-          <div className="text-slate-600 text-sm">当前浏览器不支持定位功能，请使用 Chrome / Safari / Edge 等现代浏览器</div>
+          <div className="text-slate-600 text-sm">当前浏览器不支持定位功能</div>
         )}
       </Card>
 
-      {/* 定位成功后显示内容 */}
       {locationStatus === 'success' && (
         <>
-          {/* 类型切换 */}
           <div className="flex gap-2">
             {[{ v: '医院', l: '🏥 医院' }, { v: '养老院', l: '🏠 养老院' }].map(opt => (
               <button key={opt.v} onClick={() => switchHospitalType(opt.v)}
@@ -1326,14 +1743,10 @@ export default function App() {
             ))}
           </div>
 
-          {/* 加载中 */}
           {hospitalLoading && (
-            <Card>
-              <div className="text-center py-4 text-slate-500">正在搜索附近的{hospitalType}…</div>
-            </Card>
+            <Card><div className="text-center py-4 text-slate-500">正在搜索附近的{hospitalType}…</div></Card>
           )}
 
-          {/* 错误提示 */}
           {hospitalError && !hospitalLoading && (
             <Card className="bg-rose-50 border-rose-200">
               <div className="text-rose-700 font-bold mb-1">搜索失败</div>
@@ -1341,36 +1754,21 @@ export default function App() {
             </Card>
           )}
 
-          {/* 无结果 */}
           {!hospitalLoading && !hospitalError && hospitals.length === 0 && (
-            <Card>
-              <div className="text-center py-4 text-slate-500">
-                附近 10 公里内未找到{hospitalType}，<br />
-                请尝试切换类型或扩大搜索范围
-              </div>
-            </Card>
+            <Card><div className="text-center py-4 text-slate-500">附近 10 公里内未找到{hospitalType}</div></Card>
           )}
 
-          {/* 结果列表 */}
           {!hospitalLoading && hospitals.length > 0 && (
             <>
-              <div className="text-sm text-slate-500">
-                共找到 {hospitals.length} 家{hospitalType}，按距离排序：
-              </div>
+              <div className="text-sm text-slate-500">共找到 {hospitals.length} 家{hospitalType}，按距离排序：</div>
               {hospitals.map(h => (
                 <Card key={h.id}>
                   <div className="font-bold text-slate-800 text-base">
                     {hospitalType === '医院' ? '🏥' : '🏠'} {h.name}
                   </div>
-                  <div className="text-sm text-blue-600 font-semibold mt-1">
-                    距离约 {formatDistance(h.distance)}
-                  </div>
-                  {h.address && (
-                    <div className="text-sm text-slate-500 mt-1">📍 {h.address}</div>
-                  )}
-                  {h.type && (
-                    <div className="text-xs text-slate-400 mt-1">类型：{h.type}</div>
-                  )}
+                  <div className="text-sm text-blue-600 font-semibold mt-1">距离约 {formatDistance(h.distance)}</div>
+                  {h.address && <div className="text-sm text-slate-500 mt-1">📍 {h.address}</div>}
+                  {h.type && <div className="text-xs text-slate-400 mt-1">类型：{h.type}</div>}
                   <div className="flex gap-2 mt-3">
                     {h.phone ? (
                       <a href={`tel:${h.phone}`}
@@ -1378,9 +1776,7 @@ export default function App() {
                         📞 {h.phone}
                       </a>
                     ) : (
-                      <div className="flex-1 h-11 rounded-xl bg-slate-100 text-slate-400 font-bold flex items-center justify-center">
-                        暂无电话
-                      </div>
+                      <div className="flex-1 h-11 rounded-xl bg-slate-100 text-slate-400 font-bold flex items-center justify-center">暂无电话</div>
                     )}
                     <a href={`https://uri.amap.com/marker?position=${h.location}&name=${encodeURIComponent(h.name)}`}
                       target="_blank" rel="noreferrer"
@@ -1398,14 +1794,13 @@ export default function App() {
       <Card className="bg-amber-50 border-amber-200">
         <div className="text-sm text-amber-800 leading-relaxed">
           <div className="font-bold mb-1">⚠️ 温馨提示</div>
-          以上信息由高德地图实时提供，仅供参考。具体地址、电话、营业时间以机构官方公布为准。<br />
+          以上信息由高德地图实时提供，仅供参考。<br />
           <span className="font-bold">如遇紧急情况，请立即拨打 120。</span>
         </div>
       </Card>
     </div>
   );
 
-  /* ---------- 关于我们 ---------- */
   const renderAbout = () => (
     <div className="space-y-4 fade-in">
       <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
@@ -1431,7 +1826,7 @@ export default function App() {
           • 智能风险分级：Morse、Hendrich II、Berg、TUG、Tinetti 多工具聚合<br />
           • 个体化干预计划：根据评估结果自动生成运动、用药、环境改造建议<br />
           • 附近医院查询：基于高德地图 API 实时搜索周边医疗机构<br />
-          • 隐私保护：数据本地存储，支持指纹/面容解锁
+          • 隐私保护：指纹/面容识别 + PIN 码 + 管理员密码
         </div>
       </Card>
 
@@ -1457,7 +1852,6 @@ export default function App() {
     </div>
   );
 
-  /* ---------- 我的协议 ---------- */
   const renderAgreement = () => (
     <div className="space-y-4 fade-in">
       <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
@@ -1476,7 +1870,7 @@ export default function App() {
       <Card>
         <div className="font-bold text-slate-800 mb-3">🔒 隐私政策</div>
         <div className="text-sm text-slate-600 leading-relaxed">
-          1. 本系统所有数据均保存在用户设备本地（浏览器 localStorage / 手机本地存储），不上传至任何服务器。<br /><br />
+          1. 本系统所有数据均保存在用户设备本地，不上传至任何服务器。<br /><br />
           2. 系统不收集任何个人信息用于商业用途。<br /><br />
           3. 用户可随时通过"我的-清除全部数据"功能删除所有本地数据。<br /><br />
           4. 系统支持指纹/面容解锁功能，用于防止未授权访问，生物特征信息由设备系统管理，本系统不存储任何生物特征数据。<br /><br />
@@ -1506,7 +1900,6 @@ export default function App() {
     </div>
   );
 
-  /* ---------- 联系客服 ---------- */
   const renderContact = () => (
     <div className="space-y-4 fade-in">
       <button onClick={() => go('history')} className="text-blue-600 text-lg">‹ 返回</button>
@@ -1529,21 +1922,21 @@ export default function App() {
             <span className="text-2xl">📧</span>
             <div className="flex-1">
               <div className="text-sm text-slate-500">反馈邮箱</div>
-              <div className="text-base text-slate-800 font-semibold">support@fallrisk.app</div>
+              <div className="text-base text-slate-800 font-semibold">480463315@qq.com</div>
             </div>
           </div>
           <div className="flex items-center gap-3 py-2 border-b border-slate-100">
             <span className="text-2xl">💬</span>
             <div className="flex-1">
               <div className="text-sm text-slate-500">客服微信</div>
-              <div className="text-base text-slate-800 font-semibold">fallrisk_service</div>
+              <div className="text-base text-slate-800 font-semibold">single-_-</div>
             </div>
           </div>
           <div className="flex items-center gap-3 py-2 border-b border-slate-100">
             <span className="text-2xl">📱</span>
             <div className="flex-1">
               <div className="text-sm text-slate-500">反馈电话</div>
-              <div className="text-base text-slate-800 font-semibold">400-000-0000</div>
+              <a href="tel:18281900727" className="text-base text-blue-600 font-semibold">18281900727</a>
             </div>
           </div>
           <div className="flex items-center gap-3 py-2">
@@ -1568,8 +1961,8 @@ export default function App() {
             <div>A：本系统采用国际标准化量表，但仅作初步筛查辅助，不能替代医生的专业诊断。</div>
           </div>
           <div>
-            <div className="font-bold text-slate-700">Q：可以多人使用吗？</div>
-            <div>A：可以。在"我的"页面点击"+新建档案"可以为多个老年人建立独立档案。</div>
+            <div className="font-bold text-slate-700">Q：忘记密码怎么办？</div>
+            <div>A：请让家属/护理员在锁屏页点"忘记密码"，输入管理员密码即可重置。所有数据不会丢失。</div>
           </div>
         </div>
       </Card>
@@ -1585,7 +1978,6 @@ export default function App() {
     </div>
   );
 
-  /* ---------- 底部导航 ---------- */
   const TabBar = () => (
     <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-slate-200 z-20">
       <div className="max-w-lg mx-auto grid grid-cols-4">
@@ -1605,7 +1997,6 @@ export default function App() {
     </nav>
   );
 
-  /* ---------- 主渲染 ---------- */
   const renderScreen = () => {
     if (screen === 'home') return renderHome();
     if (screen === 'newProfile') return renderNewProfile();
@@ -1617,12 +2008,17 @@ export default function App() {
     if (screen === 'result') return renderResult();
     if (screen === 'plan') return renderPlan();
     if (screen === 'history') return renderHistory();
+    if (screen === 'security') return renderSecurity();
     if (screen === 'nearby') return renderNearbyHospitals();
     if (screen === 'about') return renderAbout();
     if (screen === 'agreement') return renderAgreement();
     if (screen === 'contact') return renderContact();
     return renderHome();
   };
+
+  if (pinChecked && locked) {
+    return <LockScreen onUnlock={() => setLocked(false)} />;
+  }
 
   return (
     <div className="min-h-screen bg-slate-100 pb-24">
@@ -1634,11 +2030,12 @@ export default function App() {
                 : screen === 'result' ? '评估结果'
                   : screen === 'editProfile' ? '编辑档案'
                     : screen === 'plan' ? '我的计划'
-                      : screen === 'nearby' ? '附近医院'
-                        : screen === 'about' ? '关于我们'
-                          : screen === 'agreement' ? '我的协议'
-                            : screen === 'contact' ? '联系客服'
-                              : '跌倒风险管理'}
+                      : screen === 'security' ? '隐私与安全'
+                        : screen === 'nearby' ? '附近医院'
+                          : screen === 'about' ? '关于我们'
+                            : screen === 'agreement' ? '我的协议'
+                              : screen === 'contact' ? '联系客服'
+                                : '跌倒风险管理'}
           </div>
         </div>
       </header>
